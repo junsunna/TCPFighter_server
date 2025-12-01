@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="TCPFighter_server/TCPFighter_server.vcxproj" Id="dad357e9-6a0f-4954-88c0-2a3d6921b562" />
+</Solution>

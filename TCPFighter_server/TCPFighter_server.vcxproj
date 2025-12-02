@@ -128,10 +128,12 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="PacketDefine.h" />
+    <ClInclude Include="PacketHelper.h" />
     <ClInclude Include="PacketStructs.h" />
     <ClInclude Include="RingBuffer.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="PacketHelper.cpp" />
     <ClCompile Include="RingBuffer.cpp" />
     <ClCompile Include="server.cpp" />
   </ItemGroup>

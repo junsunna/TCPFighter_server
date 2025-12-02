@@ -10,12 +10,18 @@
 #include "PacketDefine.h"
 #include "PacketStructs.h"
 #include "RingBuffer.h"
+#include "PacketHelper.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
 #define SERVER_PORT 5000
 #define PACKET_CODE 0x89
 #define GAME_FPS    50
+
+// 공격 쿨타임
+#define dfDELAY_ATTACK1  200   // 0.5초 (공격 1, 2는 동일)
+#define dfDELAY_ATTACK2  200   // 0.5초
+#define dfDELAY_ATTACK3  400  // 1.0초
 
 // -------------------------------------------------------
 // [설정] 게임 상수 정의
@@ -95,10 +101,11 @@ struct Session {
 	// ★ 송신용 링버퍼 추가 ★
 	RingBuffer recvBuffer;
 	RingBuffer sendBuffer;
-
+	ULONGLONG nextActionEnableTime;
 	Session() : sock(INVALID_SOCKET), id(-1), x(0), y(0), direction(0), hp(100), isMoving(false) {
 		recvBuffer.Resize(10240);
 		sendBuffer.Resize(10240);
+		nextActionEnableTime = 0;
 	}
 };
 
@@ -126,6 +133,8 @@ void HandlePacket(Session* session, char* packet);
 void FlushSendBuffer(Session* session); // ★ 실제 전송을 담당할 함수
 
 void ProcAttack(Session* attacker, int attackType);
+// 행동 가능 여부 체크 및 딜레이 적용 함수
+bool CheckGlobalCooldown(Session* session, int attackType);
 // -------------------------------------------------------
 // 메인 함수
 // -------------------------------------------------------
@@ -173,25 +182,52 @@ int main() {
 
 	// 메인 루프
 	while (true) {
-		// 1. 현재 시간 측정
+		// 현재 시간 측정
 		QueryPerformanceCounter(&currTime);
-
-		// 2. 경과 시간(Delta Time) 계산 및 누적
 		accumulatedTime += (currTime.QuadPart - prevTime.QuadPart) * timeScale;
 		prevTime = currTime;
 
-		// 3. 누적된 시간이 1프레임(0.02초)을 넘어가면 게임 로직 실행 (Catch up)
+		// 네트워크 처리
+		NetworkProc();
+
+		// 누적된 시간이 1프레임(0.02초)을 넘어가면 게임 로직 실행 (Catch up)
 		while (accumulatedTime >= targetFrameTime) {
 			UpdateGame(); // ★ 50 FPS 보장 로직
 			accumulatedTime -= targetFrameTime;
 		}
 
-		// 4. 네트워크 처리는 가능한 자주 실행 (빠른 응답)
-		NetworkProc();
 	}
 
 	WSACleanup();
 	return 0;
+}
+
+// 행동 가능 여부 체크 및 딜레이 적용 함수
+bool CheckGlobalCooldown(Session* session, int attackType) {
+	// 1. 현재 시간
+	ULONGLONG currentTick = GetTickCount64();
+
+	// 2. [검사] 아직 행동 불가 시간인가?
+	if (currentTick < session->nextActionEnableTime) {
+		// 남은 시간 계산 (로그용)
+		// ULONGLONG remain = session->nextActionEnableTime - currentTick;
+		// printf("[GCD] User %d is busy. Wait %llu ms.\n", session->id, remain);
+		return false;
+	}
+
+	// 3. [적용] 스킬별로 다음 행동 가능한 시간을 다르게 설정
+	DWORD delay = 0;
+	switch (attackType) {
+	case 1: delay = dfDELAY_ATTACK1; break; // 500ms
+	case 2: delay = dfDELAY_ATTACK2; break; // 500ms
+	case 3: delay = dfDELAY_ATTACK3; break; // 1000ms
+	default: return false;
+	}
+
+	// "현재 시간 + 딜레이"까지 행동 불가로 설정
+	session->nextActionEnableTime = currentTick + delay;
+
+	return true;
 }
 
 // -------------------------------------------------------
@@ -321,40 +357,34 @@ void NetworkProc() {
 				newSession->hp = 100;
 
 				// 접속 패킷 전송
-				P_SC_CREATE_MY_CHARACTER myPacket = { 0 };
-				myPacket.header.byCode = PACKET_CODE;
-				myPacket.header.bySize = sizeof(P_SC_CREATE_MY_CHARACTER) - sizeof(PACKET_HEADER);
-				myPacket.header.byType = dfPACKET_SC_CREATE_MY_CHARACTER;
-				myPacket.iID = newSession->id;
-				myPacket.byDirection = newSession->direction;
-				myPacket.sX = newSession->x;
-				myPacket.sY = newSession->y;
-				myPacket.byHP = newSession->hp;
+				auto myPacket = PacketGenerator::MakeCreateMyCharacter(
+					newSession->id,
+					newSession->direction,
+					newSession->x,
+					newSession->y,
+					newSession->hp
+				);
 				SendPacket(newSession, (char*)&myPacket, sizeof(myPacket));
 
 				// 다른 유저 생성 패킷 처리 (생략 없이 기존 로직 유지)
-				P_SC_CREATE_OTHER_CHARACTER otherPacket = { 0 };
-				otherPacket.header.byCode = PACKET_CODE;
-				otherPacket.header.bySize = sizeof(P_SC_CREATE_OTHER_CHARACTER) - sizeof(PACKET_HEADER);
-				otherPacket.header.byType = dfPACKET_SC_CREATE_OTHER_CHARACTER;
-				otherPacket.iID = newSession->id;
-				otherPacket.byDirection = newSession->direction;
-				otherPacket.sX = newSession->x;
-				otherPacket.sY = newSession->y;
-				otherPacket.byHP = newSession->hp;
+				auto otherPacket = PacketGenerator::MakeCreateOtherCharacter(
+					newSession->id,
+					newSession->direction,
+					newSession->x,
+					newSession->y,
+					newSession->hp
+				);
 				BroadcastPacket(newSession, (char*)&otherPacket, sizeof(otherPacket));
 
 				for (auto& pair : g_clients) {
 					Session* oldUser = pair.second;
-					P_SC_CREATE_OTHER_CHARACTER oldUserPacket = { 0 };
-					oldUserPacket.header.byCode = PACKET_CODE;
-					oldUserPacket.header.bySize = sizeof(P_SC_CREATE_OTHER_CHARACTER) - sizeof(PACKET_HEADER);
-					oldUserPacket.header.byType = dfPACKET_SC_CREATE_OTHER_CHARACTER;
-					oldUserPacket.iID = oldUser->id;
-					oldUserPacket.byDirection = oldUser->direction;
-					oldUserPacket.sX = oldUser->x;
-					oldUserPacket.sY = oldUser->y;
-					oldUserPacket.byHP = oldUser->hp;
+					auto oldUserPacket = PacketGenerator::MakeCreateOtherCharacter(
+						oldUser->id,
+						oldUser->direction,
+						oldUser->x,
+						oldUser->y,
+						oldUser->hp
+					);
 					SendPacket(newSession, (char*)&oldUserPacket, sizeof(oldUserPacket));
 				}
 				g_clients[clientSock] = newSession;
@@ -453,11 +483,7 @@ void Disconnect(SOCKET sock) {
 		Session* session = g_clients[sock];
 		printf("Client Disconnected: ID %d\n", session->id);
 
-		P_SC_DELETE_CHARACTER packet;
-		packet.header.byCode = PACKET_CODE;
-		packet.header.bySize = sizeof(P_SC_DELETE_CHARACTER) - sizeof(PACKET_HEADER);
-		packet.header.byType = dfPACKET_SC_DELETE_CHARACTER;
-		packet.iID = session->id;
+		auto packet = PacketGenerator::MakeDeleteCharacter(session->id);
 
 		BroadcastPacket(session, (char*)&packet, sizeof(packet));
 
@@ -488,14 +514,9 @@ void HandlePacket(Session* session, char* packet) {
 		session->isMoving = true;
 
 		// 3. 브로드캐스트
-		P_SC_MOVE_START sendPacket = { 0 };
-		sendPacket.header.byCode = PACKET_CODE;
-		sendPacket.header.bySize = sizeof(P_SC_MOVE_START) - sizeof(PACKET_HEADER);
-		sendPacket.header.byType = dfPACKET_SC_MOVE_START;
-		sendPacket.iID = session->id;
-		sendPacket.byDirection = session->direction;
-		sendPacket.sX = session->x;
-		sendPacket.sY = session->y;
+		auto sendPacket = PacketGenerator::MakeMoveStart(
+			session->id, session->direction, session->x, session->y
+		);
 		BroadcastPacket(session, (char*)&sendPacket, sizeof(sendPacket));
 	}
 	break;
@@ -526,19 +547,16 @@ void HandlePacket(Session* session, char* packet) {
 		session->y = pPacket->sY;
 
 		// 3. 브로드캐스트
-		P_SC_MOVE_STOP sendPacket = { 0 };
-		sendPacket.header.byCode = PACKET_CODE;
-		sendPacket.header.bySize = sizeof(P_SC_MOVE_STOP) - sizeof(PACKET_HEADER);
-		sendPacket.header.byType = dfPACKET_SC_MOVE_STOP;
-		sendPacket.iID = session->id;
-		sendPacket.byDirection = session->direction;
-		sendPacket.sX = session->x;
-		sendPacket.sY = session->y;
+		auto sendPacket = PacketGenerator::MakeMoveStop(
+			session->id, session->direction, session->x, session->y
+		);
 		BroadcastPacket(session, (char*)&sendPacket, sizeof(sendPacket));
 	}
 	break;
 	case dfPACKET_CS_ATTACK1:
 	{
+		if (CheckGlobalCooldown(session, 1) == false) return;
+
 		P_CS_ATTACK* pPacket = (P_CS_ATTACK*)packet; // 공격 패킷 구조체 사용
 
 		// 1. 서버 좌표 업데이트 (공격하는 위치 저장)
@@ -547,15 +565,9 @@ void HandlePacket(Session* session, char* packet) {
 		session->y = pPacket->sY;
 
 		// 2. 다른 유저들에게 "얘가 공격1 했다"고 알림
-		P_SC_ATTACK sendPacket = { 0 };
-		sendPacket.header.byCode = PACKET_CODE;
-		sendPacket.header.bySize = sizeof(P_SC_ATTACK) - sizeof(PACKET_HEADER); // 사이즈 계산 주의!
-		sendPacket.header.byType = dfPACKET_SC_ATTACK1; // ★ 타입 주의 (SC_ATTACK1)
-
-		sendPacket.iID = session->id;
-		sendPacket.byDirection = session->direction;
-		sendPacket.sX = session->x;
-		sendPacket.sY = session->y;
+		auto sendPacket = PacketGenerator::MakeAttack1(
+			session->id, session->direction, session->x, session->y
+		);
 
 		// 나를 제외한 모두에게 전송
 		BroadcastPacket(session, (char*)&sendPacket, sizeof(sendPacket));
@@ -566,21 +578,17 @@ void HandlePacket(Session* session, char* packet) {
 	// 공격 2 (X키)
 	case dfPACKET_CS_ATTACK2:
 	{
+		if (CheckGlobalCooldown(session, 2) == false) return;
+
 		P_CS_ATTACK* pPacket = (P_CS_ATTACK*)packet;
 
 		session->direction = pPacket->byDirection;
 		session->x = pPacket->sX;
 		session->y = pPacket->sY;
 
-		P_SC_ATTACK sendPacket = { 0 };
-		sendPacket.header.byCode = PACKET_CODE;
-		sendPacket.header.bySize = sizeof(P_SC_ATTACK) - sizeof(PACKET_HEADER);
-		sendPacket.header.byType = dfPACKET_SC_ATTACK2; // ★ 타입 주의 (SC_ATTACK2)
-
-		sendPacket.iID = session->id;
-		sendPacket.byDirection = session->direction;
-		sendPacket.sX = session->x;
-		sendPacket.sY = session->y;
+		auto sendPacket = PacketGenerator::MakeAttack2(
+			session->id, session->direction, session->x, session->y
+		);
 
 		BroadcastPacket(session, (char*)&sendPacket, sizeof(sendPacket));
 		ProcAttack(session, 2);
@@ -591,21 +599,17 @@ void HandlePacket(Session* session, char* packet) {
 	// 공격 3 (C키)
 	case dfPACKET_CS_ATTACK3:
 	{
+		if (CheckGlobalCooldown(session, 3) == false) return;
+
 		P_CS_ATTACK* pPacket = (P_CS_ATTACK*)packet;
 
 		session->direction = pPacket->byDirection;
 		session->x = pPacket->sX;
 		session->y = pPacket->sY;
 
-		P_SC_ATTACK sendPacket = { 0 };
-		sendPacket.header.byCode = PACKET_CODE;
-		sendPacket.header.bySize = sizeof(P_SC_ATTACK) - sizeof(PACKET_HEADER);
-		sendPacket.header.byType = dfPACKET_SC_ATTACK3; // ★ 타입 주의 (SC_ATTACK3)
-
-		sendPacket.iID = session->id;
-		sendPacket.byDirection = session->direction;
-		sendPacket.sX = session->x;
-		sendPacket.sY = session->y;
+		auto sendPacket = PacketGenerator::MakeAttack3(
+			session->id, session->direction, session->x, session->y
+		);
 
 		BroadcastPacket(session, (char*)&sendPacket, sizeof(sendPacket));
 		ProcAttack(session, 3);
@@ -692,14 +696,11 @@ void ProcAttack(Session* attacker, int attackType) {
 			printf("[HIT!] Attacker:%d -> Victim:%d (HP:%d)\n", attacker->id, victim->id, victim->hp);
 
 			// 5. 데미지 패킷 브로드캐스팅 (SC_DAMAGE)
-			P_SC_DAMAGE damagePacket;
-			damagePacket.header.byCode = PACKET_CODE;
-			damagePacket.header.bySize = sizeof(P_SC_DAMAGE) - sizeof(PACKET_HEADER);
-			damagePacket.header.byType = dfPACKET_SC_DAMAGE;
-
-			damagePacket.iAttackID = attacker->id;
-			damagePacket.iDamageID = victim->id;
-			damagePacket.byDamageHP = victim->hp;
+			auto damagePacket = PacketGenerator::MakeDamage(
+				attacker->id,
+				victim->id,
+				victim->hp
+			);
 
 			BroadcastPacket(nullptr, (char*)&damagePacket, sizeof(damagePacket)); // 모두에게 전송
 

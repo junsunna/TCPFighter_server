@@ -1,6 +1,13 @@
+#include <WinSock2.h>
+#include <algorithm>
+#include <cstring> 
+#include <cstdint> 
+#include <vector>
+#include <cmath>
+#include <iostream>
+#include <unordered_map>
+
 #include "RingBuffer.h"
-#include <algorithm> // std::min
-#include <cstring>   // memcpy
 
 // -------- 생성자 및 소멸자 --------
 
